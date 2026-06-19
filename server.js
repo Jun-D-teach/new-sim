@@ -125,6 +125,165 @@ function formatAttendanceId(dateObj, studentId) {
   return `${year}${month}${day}_${studentId}`;
 }
 
+async function ensureSchema() {
+  const requiredStatuses = [
+    "hadir",
+    "terlambat",
+    "sangat terlambat",
+    "pulang",
+    "tidak hadir",
+  ];
+
+  const [cols] = await pool.query(
+    `SELECT COLUMN_TYPE
+       FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'attendance'
+        AND COLUMN_NAME = 'status'`,
+  );
+  const columnType = cols.length ? String(cols[0].COLUMN_TYPE) : "";
+  const hasAllStatuses = requiredStatuses.every((status) =>
+    columnType.includes(`'${status}'`),
+  );
+  if (columnType && !hasAllStatuses) {
+    const enumDef = requiredStatuses.map((status) => `'${status}'`).join(",");
+    await pool.query(
+      `ALTER TABLE attendance MODIFY COLUMN status ENUM(${enumDef}) NOT NULL`,
+    );
+    console.log("Schema: enum attendance.status diperbarui");
+  }
+
+  await pool.query(
+    `INSERT IGNORE INTO scanners (scanner_id, scanner_name, location, status_active)
+     VALUES (?, ?, ?, 1)`,
+    ["SYSTEM", "Sistem Otomatis", "Auto"],
+  );
+
+  await pool.query(
+    `INSERT IGNORE INTO settings (setting_key, setting_value) VALUES (?, ?)`,
+    ["absent_notify_time", "08:00"],
+  );
+}
+
+async function markAbsentStudentsAndNotify(nowArg) {
+  const now = nowArg || new Date();
+  const attendanceDate = formatDateToYmd(now);
+  const attendanceTime = formatTimeToHms(now);
+
+  let connection;
+  let processed = 0;
+  let notified = 0;
+
+  try {
+    connection = await pool.getConnection();
+
+    const [students] = await connection.query(
+      `SELECT s.*
+         FROM students s
+        WHERE s.status_active = 'aktif'
+          AND NOT EXISTS (
+            SELECT 1 FROM attendance a
+             WHERE a.student_id = s.student_id
+               AND a.attendance_date = ?
+          )`,
+      [attendanceDate],
+    );
+
+    for (const student of students) {
+      const attendanceId = formatAttendanceId(now, student.student_id);
+      try {
+        await connection.beginTransaction();
+
+        await connection.query(
+          "INSERT INTO attendance (attendance_id, student_id, student_name, class_id, attendance_date, attendance_time, status, scanner_id, notification_sent) VALUES (?,?,?,?,?,?,?,?,0)",
+          [
+            attendanceId,
+            student.student_id,
+            student.student_name,
+            student.class_id,
+            attendanceDate,
+            attendanceTime,
+            "tidak hadir",
+            "SYSTEM",
+          ],
+        );
+
+        if (student.parent_phone) {
+          const message = `Yth. Orang Tua/Wali Ananda ${student.student_name} (${student.class_id}). Sampai pukul ${attendanceTime.slice(0, 5)} ananda TIDAK HADIR / belum melakukan absensi di madrasah pada ${attendanceDate}. Mohon konfirmasi ke pihak madrasah apabila ada keperluan. Terima kasih.`;
+          const waResult = await sendWhatsApp(student.parent_phone, message);
+
+          await connection.query(
+            "INSERT INTO notifications (notification_id, attendance_id, student_id, parent_id, parent_name, parent_phone, message, channel, status) VALUES (?,?,?,?,?,?,?,?,?)",
+            [
+              `${attendanceId}_A`,
+              attendanceId,
+              student.student_id,
+              student.parent_id,
+              student.parent_name,
+              student.parent_phone,
+              message,
+              "whatsapp",
+              waResult.success ? "sent" : "failed",
+            ],
+          );
+
+          if (waResult.success) {
+            await connection.query(
+              "UPDATE attendance SET notification_sent = 1 WHERE attendance_id = ?",
+              [attendanceId],
+            );
+            notified += 1;
+          }
+        }
+
+        await connection.commit();
+        processed += 1;
+      } catch (err) {
+        await connection.rollback();
+        console.error(
+          `ABSENT NOTIFY ERROR (${student.student_id}):`,
+          err.message,
+        );
+      }
+    }
+  } catch (error) {
+    console.error("MARK ABSENT ERROR:", error.message);
+    throw error;
+  } finally {
+    if (connection) connection.release();
+  }
+
+  return { processed, notified };
+}
+
+let lastAbsentRunDate = null;
+async function absentSchedulerTick() {
+  try {
+    const [rows] = await pool.query(
+      "SELECT setting_value FROM settings WHERE setting_key = 'absent_notify_time' LIMIT 1",
+    );
+    const configured = rows.length ? String(rows[0].setting_value || "").trim() : "";
+    if (!configured) return;
+
+    const target = configured.slice(0, 5);
+    const now = new Date();
+    const current = `${String(now.getHours()).padStart(2, "0")}:${String(
+      now.getMinutes(),
+    ).padStart(2, "0")}`;
+    const today = formatDateToYmd(now);
+
+    if (current === target && lastAbsentRunDate !== today) {
+      lastAbsentRunDate = today;
+      const result = await markAbsentStudentsAndNotify(now);
+      console.log(
+        `Absent notify dijalankan (${today}): ${result.processed} ditandai tidak hadir, ${result.notified} WA terkirim`,
+      );
+    }
+  } catch (error) {
+    console.error("ABSENT SCHEDULER ERROR:", error.message);
+  }
+}
+
 function excelDateToFormatted(value) {
   if (value === undefined || value === null || value === "") {
     return null;
@@ -2469,6 +2628,24 @@ app.post("/api/settings", verifyAdminApiKey, async (req, res) => {
     if (connection) connection.release();
   }
 });
+app.post("/api/attendance/mark-absent", verifyAdminApiKey, async (req, res) => {
+  try {
+    const result = await markAbsentStudentsAndNotify();
+    res.json({
+      success: true,
+      message: `Selesai. ${result.processed} siswa ditandai tidak hadir, ${result.notified} WA terkirim.`,
+      data: result,
+    });
+  } catch (error) {
+    console.error("MARK ABSENT API ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Gagal menandai siswa tidak hadir",
+      error: error.message,
+    });
+  }
+});
+
 //app.get("/api/export/report", verifyAdminApiKey, async (req, res) => {
 app.get("/api/export/report", async (req, res) => {
   try {
@@ -3911,7 +4088,10 @@ app.listen(PORT, "0.0.0.0", async () => {
 
   try {
     await testConnection();
+    await ensureSchema();
+    setInterval(absentSchedulerTick, 60 * 1000);
+    console.log("Penjadwal absen otomatis aktif (cek tiap menit)");
   } catch (error) {
-    console.error("Server started but DB test failed:", error.message);
+    console.error("Server started but DB setup failed:", error.message);
   }
 });
