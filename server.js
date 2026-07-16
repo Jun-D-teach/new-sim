@@ -288,21 +288,29 @@ function excelDateToFormatted(value) {
   if (value === undefined || value === null || value === "") {
     return null;
   }
-
   if (typeof value === "number") {
     const parsed = XLSX.SSF.parse_date_code(value);
     if (!parsed) return null;
-
     const day = String(parsed.d).padStart(2, "0");
     const month = String(parsed.m).padStart(2, "0");
     const year = String(parsed.y);
-
     return `${day}/${month}/${year}`;
   }
-
   return String(value).trim();
 }
+
+// ==========================================
+// TAMBAHKAN FUNGSI INI DI SINI (Konversi ke WIB)
+// ==========================================
+function getWIBDate(dateObj = new Date()) {
+  // WIB = UTC+7
+  const utc = dateObj.getTime() + (dateObj.getTimezoneOffset() * 60000);
+  const wibTime = new Date(utc + (3600000 * 7));
+  return wibTime;
+}
+
 function verifyAdminApiKey(req, res, next) {
+
   const apiKey = req.headers["x-admin-key"];
 
   if (!apiKey) {
@@ -1339,12 +1347,12 @@ app.post("/api/attendance", async (req, res) => {
     if (student.status_active !== "aktif")
       throw { status: 400, message: "Siswa tidak aktif" };
 
-    const config = Object.fromEntries(
-      settingsRows.map((s) => [s.setting_key, s.setting_value]),
-    );
-    const now = new Date();
-    const attendanceDate = formatDateToYmd(now);
-    const attendanceTime = formatTimeToHms(now);
+const config = Object.fromEntries(
+  settingsRows.map((s) => [s.setting_key, s.setting_value]),
+);
+const now = getWIBDate(); // Gunakan waktu WIB
+const attendanceDate = formatDateToYmd(now);
+const attendanceTime = formatTimeToHms(now);
     const attendanceSeconds = parseTimeToSeconds(attendanceTime);
 
     const openSeconds = parseTimeToSeconds(config.attendance_open_time);
