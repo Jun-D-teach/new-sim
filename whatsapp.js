@@ -2,6 +2,7 @@ const fetch = require("node-fetch");
 
 async function sendWhatsApp(phone, message) {
   try {
+    // PERBAIKAN: Gunakan \D (backslash + D) untuk menghapus semua karakter non-angka
     const cleanPhone = String(phone || "").replace(/\D/g, "");
 
     if (!cleanPhone) {
@@ -11,20 +12,31 @@ async function sendWhatsApp(phone, message) {
       };
     }
 
+    // Pastikan diawali dengan 62
+    const finalPhone = cleanPhone.startsWith("62") ? cleanPhone : "62" + cleanPhone;
+
+    const token = process.env.FONNTE_TOKEN;
+    if (!token) {
+      console.error("FONNTE TOKEN TIDAK DITEMUKAN DI ENVIRONMENT VARIABLES!");
+      return {
+        success: false,
+        message: "Konfigurasi server tidak lengkap (FONNTE_TOKEN hilang)",
+      };
+    }
+
     const response = await fetch("https://api.fonnte.com/send", {
       method: "POST",
       headers: {
-        Authorization: process.env.FONNTE_TOKEN,
+        Authorization: token,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        target: cleanPhone,
+        target: finalPhone,
         message: message,
       }),
     });
 
     const text = await response.text();
-
     let result;
     try {
       result = JSON.parse(text);
