@@ -1958,7 +1958,200 @@ app.post(
     }
   },
 );
+app.post(
+  "/api/import/teachers",
+  verifyAdminApiKey,
+  upload.single("file"),
+  async (req, res) => {
+    let connection;
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "File Excel wajib diupload",
+        });
+      }
 
+      const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+      const data = XLSX.utils.sheet_to_json(sheet, {
+        raw: true,
+        defval: "",
+      });
+
+      if (data.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "File kosong",
+        });
+      }
+
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+
+      let inserted = 0;
+      let skipped = 0;
+      let errors = [];
+
+      for (const row of data) {
+        try {
+          const teacher_id = String(row.teacher_id || "").trim();
+          const teacher_name = String(row.teacher_name || "").trim();
+          const nip = String(row.nip || "").trim();
+          const phone = String(row.phone || "").trim();
+          const email = String(row.email || "").trim();
+          const status_active = String(row.status_active || "aktif").trim();
+          const roles = String(row.roles || "guru")
+            .split(",")
+            .map((r) => r.trim())
+            .filter((r) => r);
+
+          // Validasi data wajib
+          if (!teacher_id || !teacher_name) {
+            errors.push({
+              row: data.indexOf(row) + 1,
+              message: "teacher_id dan teacher_name wajib diisi",
+            });
+            skipped++;
+            continue;
+          }
+
+          // Username dari NIP atau email
+          const username = nip || email;
+          if (!username) {
+            errors.push({
+              row: data.indexOf(row) + 1,
+              message: "NIP atau email wajib diisi untuk username",
+            });
+            skipped++;
+            continue;
+          }
+
+          // Cek apakah guru sudah ada
+          const [existingTeacher] = await connection.query(
+            "SELECT teacher_id FROM teachers WHERE teacher_id = ? LIMIT 1",
+            [teacher_id]
+          );
+
+          if (existingTeacher.length > 0) {
+            // Update guru yang sudah ada
+            const defaultPassword = "default12345";
+            const hashedPassword = await bcrypt.hash(defaultPassword, 10);
+
+            await connection.query(
+              `
+              UPDATE teachers
+              SET
+                teacher_name = ?,
+                nip = ?,
+                phone = ?,
+                email = ?,
+                username = ?,
+                status_active = ?,
+                password = COALESCE(password, ?),
+                updated_at = CURRENT_TIMESTAMP
+              WHERE teacher_id = ?
+              `,
+              [
+                teacher_name,
+                nip || null,
+                phone || null,
+                email || null,
+                username,
+                status_active || "aktif",
+                hashedPassword,
+                teacher_id,
+              ]
+            );
+
+            // Update roles
+            await connection.query(
+              "DELETE FROM teacher_roles WHERE teacher_id = ?",
+              [teacher_id]
+            );
+          } else {
+            // Insert guru baru
+            const defaultPassword = "default12345";
+            const hashedPassword = await bcrypt.hash(defaultPassword, 10);
+
+            await connection.query(
+              `
+              INSERT INTO teachers (
+                teacher_id,
+                teacher_name,
+                nip,
+                phone,
+                email,
+                username,
+                password,
+                status_active
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              `,
+              [
+                teacher_id,
+                teacher_name,
+                nip || null,
+                phone || null,
+                email || null,
+                username,
+                hashedPassword,
+                status_active || "aktif",
+              ]
+            );
+          }
+
+          // Insert roles
+          const selectedRoles = roles.length ? roles : ["guru"];
+          if (!selectedRoles.includes("guru")) {
+            selectedRoles.unshift("guru");
+          }
+
+          for (const role of selectedRoles) {
+            await connection.query(
+              `
+              INSERT INTO teacher_roles (teacher_id, role)
+              VALUES (?, ?)
+              ON DUPLICATE KEY UPDATE role = VALUES(role)
+              `,
+              [teacher_id, role]
+            );
+          }
+
+          inserted++;
+        } catch (rowError) {
+          console.error("Error processing row:", rowError);
+          errors.push({
+            row: data.indexOf(row) + 1,
+            message: rowError.message,
+          });
+          skipped++;
+        }
+      }
+
+      await connection.commit();
+
+      res.json({
+        success: true,
+        message: "Import guru berhasil",
+        total: data.length,
+        inserted,
+        skipped,
+        errors: errors.length > 0 ? errors : undefined,
+      });
+    } catch (error) {
+      if (connection) await connection.rollback();
+      console.error("IMPORT TEACHERS ERROR:", error);
+      res.status(500).json({
+        success: false,
+        message: "Gagal import data guru",
+        error: error.message,
+      });
+    } finally {
+      if (connection) connection.release();
+    }
+  }
+);
 app.get("/api/classes", verifyAdminApiKey, async (req, res) => {
   try {
     const [rows] = await pool.query(
